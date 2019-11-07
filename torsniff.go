@@ -2,35 +2,26 @@ package main
 
 import (
 	"bytes"
-	"container/list"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/marksamman/bencode"
+	"github.com/mitchellh/go-homedir"
 	"github.com/spf13/cobra"
+	"go.etcd.io/etcd/pkg/fileutil"
 )
 
 const (
 	directory = "torrents"
 )
-
-func homeDir() string {
-	env := "HOME"
-	if runtime.GOOS == "windows" {
-		env = "USERPROFILE"
-	} else if runtime.GOOS == "plan9" {
-		env = "home"
-	}
-	return os.Getenv(env)
-}
 
 type tfile struct {
 	name   string
@@ -117,7 +108,6 @@ func parseTorrent(meta []byte, infohashHex string) (*torrent, error) {
 }
 
 type torsniff struct {
-	mu         sync.RWMutex
 	laddr      string
 	maxFriends int
 	maxPeers   int
@@ -135,25 +125,26 @@ func (t *torsniff) run() error {
 		return err
 	}
 
+	dht.run()
+
 	log.Println("running, it may take a few minutes...")
 
 	for {
 		select {
-		case <-dht.announcementNotifier:
-			var next *list.Element
-			for e := dht.announcements.Front(); e != nil; e = next {
-				tokens <- struct{}{}
-				next = e.Next()
-				ac := e.Value.(*announcement)
-				go t.work(ac, tokens)
-				dht.announcements.Remove(e)
+		case <-dht.announcements.wait():
+			for {
+				if ac := dht.announcements.get(); ac != nil {
+					tokens <- struct{}{}
+					go t.work(ac, tokens)
+					continue
+				}
+				break
 			}
 		case <-dht.die:
 			return dht.errDie
 		}
 	}
 
-	return nil
 }
 
 func (t *torsniff) work(ac *announcement, tokens chan struct{}) {
@@ -165,31 +156,25 @@ func (t *torsniff) work(ac *announcement, tokens chan struct{}) {
 		return
 	}
 
-	t.mu.RLock()
 	peerAddr := ac.peer.String()
 	if t.blacklist.has(peerAddr) {
-		t.mu.RUnlock()
 		return
 	}
-	t.mu.RUnlock()
 
 	wire := newMetaWire(string(ac.infohash), peerAddr, t.timeout)
 	defer wire.free()
 
-	data, err := wire.fetch()
+	meta, err := wire.fetch()
 	if err != nil {
-		t.mu.Lock()
 		t.blacklist.add(peerAddr)
-		t.mu.Unlock()
 		return
 	}
 
-	_, err = t.saveTorrent(ac.infohashHex, data)
-	if err != nil {
+	if err := t.saveTorrent(ac.infohashHex, meta); err != nil {
 		return
 	}
 
-	torrent, err := parseTorrent(data, ac.infohashHex)
+	torrent, err := parseTorrent(meta, ac.infohashHex)
 	if err != nil {
 		return
 	}
@@ -206,32 +191,31 @@ func (t *torsniff) isTorrentExist(infohashHex string) bool {
 	return err == nil
 }
 
-func (t *torsniff) saveTorrent(infohashHex string, data []byte) (string, error) {
+func (t *torsniff) saveTorrent(infohashHex string, data []byte) error {
 	name, dir := t.torrentPath(infohashHex)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", err
+		return err
 	}
-
-	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE, 0755)
-	if err != nil {
-		return "", err
-	}
-
-	defer f.Close()
 
 	d, err := bencode.Decode(bytes.NewBuffer(data))
 	if err != nil {
-		return "", err
+		return err
 	}
+
+	f, err := fileutil.TryLockFile(name, os.O_WRONLY|os.O_CREATE, 0755)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 
 	_, err = f.Write(bencode.Encode(map[string]interface{}{
 		"info": d,
 	}))
 	if err != nil {
-		return "", err
+		return err
 	}
 
-	return name, nil
+	return nil
 }
 
 func (t *torsniff) torrentPath(infohashHex string) (name string, dir string) {
@@ -249,14 +233,21 @@ func main() {
 	var timeout time.Duration
 	var dir string
 	var verbose bool
-	var maxFriends int
+	var friends int
+
+	home, err := homedir.Dir()
+	userHome := path.Join(home, directory)
 
 	root := &cobra.Command{
 		Use:          "torsniff",
-		Short:        "torsniff - a sniffer fetching torrents from BT network",
+		Short:        "torsniff - A sniffer that sniffs torrents from BitTorrent network.",
 		SilenceUsage: true,
 	}
 	root.RunE = func(cmd *cobra.Command, args []string) error {
+		if dir == userHome && err != nil {
+			return err
+		}
+
 		absDir, err := filepath.Abs(dir)
 		if err != nil {
 			return err
@@ -268,9 +259,9 @@ func main() {
 		}
 
 		p := &torsniff{
-			laddr:      fmt.Sprintf("%s:%d", addr, port),
+			laddr:      net.JoinHostPort(addr, strconv.Itoa(int(port))),
 			timeout:    timeout,
-			maxFriends: maxFriends,
+			maxFriends: friends,
 			maxPeers:   peers,
 			secret:     string(randBytes(20)),
 			dir:        absDir,
@@ -278,15 +269,16 @@ func main() {
 		}
 		return p.run()
 	}
-	root.Flags().StringVarP(&addr, "addr", "a", "0.0.0.0", "listen on given address")
+
+	root.Flags().StringVarP(&addr, "addr", "a", "", "listen on given address (default all, ipv4 and ipv6)")
 	root.Flags().Uint16VarP(&port, "port", "p", 6881, "listen on given port")
-	root.Flags().IntVarP(&maxFriends, "maxFriends", "f", 500, "max fiends to make with per second")
+	root.Flags().IntVarP(&friends, "friends", "f", 500, "max fiends to make with per second")
 	root.Flags().IntVarP(&peers, "peers", "e", 400, "max peers to connect to download torrents")
 	root.Flags().DurationVarP(&timeout, "timeout", "t", 10*time.Second, "max time allowed for downloading torrents")
-	root.Flags().StringVarP(&dir, "dir", "d", path.Join(homeDir(), directory), "the directory to store the torrents")
+	root.Flags().StringVarP(&dir, "dir", "d", userHome, "the directory to store the torrents")
 	root.Flags().BoolVarP(&verbose, "verbose", "v", true, "run in verbose mode")
 
 	if err := root.Execute(); err != nil {
-		fmt.Errorf("could not start: %s\n", err)
+		fmt.Println(fmt.Errorf("could not start: %s", err))
 	}
 }
